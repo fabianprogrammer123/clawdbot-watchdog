@@ -66,16 +66,20 @@ def check_docker_running() -> CheckResult:
 
 
 def check_control_ui() -> CheckResult:
-    """Check if the OpenClaw control UI is responding."""
+    """Check if the OpenClaw control UI is responding (via SSH since it listens on localhost)."""
     try:
-        resp = requests.get(config.CONTROL_UI_URL, timeout=config.HTTP_TIMEOUT)
-        if resp.status_code == 200:
-            return CheckResult("control_ui", True, f"Control UI responding (HTTP {resp.status_code})")
-        return CheckResult("control_ui", False, f"Control UI returned HTTP {resp.status_code}", f"HTTP {resp.status_code}")
-    except requests.ConnectionError as e:
-        return CheckResult("control_ui", False, "Control UI unreachable", str(e))
-    except requests.Timeout:
-        return CheckResult("control_ui", False, "Control UI timed out", "Request timed out")
+        result = _ssh_cmd(
+            f"curl -s -o /dev/null -w '%{{http_code}}' http://localhost:{config.CONTROL_UI_PORT}/ 2>&1",
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return CheckResult("control_ui", False, "Control UI check failed", result.stderr.strip())
+        status_code = result.stdout.strip()
+        if status_code == "200":
+            return CheckResult("control_ui", True, f"Control UI responding (HTTP {status_code})")
+        return CheckResult("control_ui", False, f"Control UI returned HTTP {status_code}", f"HTTP {status_code}")
+    except subprocess.TimeoutExpired:
+        return CheckResult("control_ui", False, "Control UI check timed out", "Timeout")
     except Exception as e:
         return CheckResult("control_ui", False, "Control UI check error", str(e))
 
