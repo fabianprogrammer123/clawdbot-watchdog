@@ -23,9 +23,16 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -i $
 GATEWAY="openclaw-openclaw-gateway-1"
 OPENCLAW_DIR="/home/fabian/openclaw"
 
+DEV_MODE_FILE="$WATCHDOG_DIR/DEV_MODE"
+
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [check.sh] $1" >> "$LOG_FILE"
 }
+
+# === DEV MODE: skip all checks and recovery ===
+if [ -f "$DEV_MODE_FILE" ]; then
+    exit 0
+fi
 
 # Read bash_failures counter from state file (simple integer file)
 BASH_STATE="$WATCHDOG_DIR/bash_state"
