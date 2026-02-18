@@ -9,23 +9,50 @@ load_dotenv(Path(__file__).parent / ".env")
 
 # Target VM
 TARGET_IP = "136.117.149.33"
+TARGET_INTERNAL_IP = "10.138.0.2"
 SSH_USER = "fabian"
 SSH_KEY_PATH = os.path.expanduser("~/.ssh/id_ed25519")
 SSH_TIMEOUT = 10  # seconds
 
-# Control UI
+# Ports
 CONTROL_UI_PORT = 18789
-CONTROL_UI_URL = f"http://{TARGET_IP}:{CONTROL_UI_PORT}"
+BRIDGE_PORT = 18790
+WEBSITE_PORT = 80
 HTTP_TIMEOUT = 10  # seconds
 
 # Paths on the target VM
 OPENCLAW_DIR = "/home/fabian/openclaw"
 OPENCLAW_CONFIG_DIR = "/home/fabian/.openclaw"
+WORKSPACE_DIR = "/home/fabian/.openclaw/workspace-reception"
+WEBSITE_DIR = "/home/fabian/.openclaw/website"
+DASHBOARD_DATA = "/home/fabian/.openclaw/website/dashboard/data.json"
 
-# Health check thresholds
-MAX_CONSECUTIVE_FAILURES = 2
+# Docker container names
+GATEWAY_CONTAINER = "openclaw-openclaw-gateway-1"
+WEBSITE_CONTAINER = "openclaw-website-1"
+# CLI containers are ephemeral — don't monitor them
+
+# Gateway boot time (apt-get, npm install, playwright install on startup)
+GATEWAY_BOOT_SECONDS = 30
+
+# Health check thresholds — per-check severity
+# "critical" = act after 1 failure, "warning" = act after 2, "info" = log only
+CHECK_SEVERITY = {
+    "ssh_reachable": "critical",
+    "gateway_running": "critical",
+    "whatsapp_connected": "warning",
+    "control_ui": "warning",
+    "website_serving": "info",
+    "heartbeat_fresh": "info",
+    "dashboard_fresh": "info",
+    "disk_space": "warning",
+    "resources": "info",
+}
+
 DISK_USAGE_THRESHOLD = 90  # percent
 MEMORY_USAGE_THRESHOLD = 90  # percent
+HEARTBEAT_STALE_MINUTES = 45  # heartbeat fires every 30 min
+DASHBOARD_STALE_MINUTES = 5   # collector updates every 60s
 
 # State file to track consecutive failures
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -39,8 +66,12 @@ LOG_DIR.mkdir(exist_ok=True)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GITHUB_PAT = os.getenv("GITHUB_PAT", "")
 
-# Claude model (Sonnet for cost efficiency)
-CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+# Claude model — Haiku for cost efficiency (only called on actual failures)
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+# Git repos the bot uses (for monitoring divergence)
+BOT_WORKSPACE_REPO = "fabianprogrammer123/clawdbot-workspace"
+BOT_WEBSITE_REPO = "fabianprogrammer123/axiom-website"
 
 # GCP
 GCP_PROJECT = "luminous-return-468119-i1"

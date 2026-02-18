@@ -1,4 +1,7 @@
-"""Recovery actions for the openclaw-server VM."""
+"""Recovery actions for ClawdBot on openclaw-server.
+
+Actions are ordered from least to most disruptive.
+Each action returns True if it succeeded."""
 
 import subprocess
 import logging
@@ -14,7 +17,7 @@ def _ssh_cmd(command: str, timeout: int = 30) -> subprocess.CompletedProcess:
     ssh_args = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout={}".format(config.SSH_TIMEOUT),
+        "-o", f"ConnectTimeout={config.SSH_TIMEOUT}",
         "-o", "BatchMode=yes",
         "-i", config.SSH_KEY_PATH,
         f"{config.SSH_USER}@{config.TARGET_IP}",
@@ -23,84 +26,129 @@ def _ssh_cmd(command: str, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(ssh_args, capture_output=True, text=True, timeout=timeout)
 
 
-def restart_containers() -> bool:
-    """Restart Docker containers on the target VM."""
-    logger.info("ACTION: Restarting Docker containers...")
-    try:
-        # Stop containers
-        result = _ssh_cmd(f"cd {config.OPENCLAW_DIR} && docker compose down", timeout=60)
-        if result.returncode != 0:
-            logger.warning(f"docker compose down stderr: {result.stderr}")
+def _wait_for_whatsapp(max_wait: int = 60) -> bool:
+    """Wait for WhatsApp to reconnect after a restart."""
+    logger.info(f"Waiting up to {max_wait}s for WhatsApp reconnection...")
+    for attempt in range(max_wait // 5):
+        time.sleep(5)
+        try:
+            result = _ssh_cmd(
+                f"docker logs --tail 30 {config.GATEWAY_CONTAINER} 2>&1 | grep -c 'Listening for.*inbound messages'",
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip() != "0":
+                logger.info(f"WhatsApp reconnected (attempt {attempt + 1})")
+                return True
+        except Exception:
+            pass
+    logger.warning("WhatsApp did not reconnect within timeout")
+    return False
 
-        # Wait a moment
+
+def restart_gateway() -> bool:
+    """Restart only the gateway container (least disruptive)."""
+    logger.info("ACTION: Restarting gateway container...")
+    try:
+        result = _ssh_cmd(
+            f"cd {config.OPENCLAW_DIR} && docker compose restart openclaw-gateway",
+            timeout=60,
+        )
+        if result.returncode != 0:
+            logger.error(f"Gateway restart failed: {result.stderr}")
+            return False
+
+        logger.info("Gateway container restarted, waiting for boot...")
+        time.sleep(config.GATEWAY_BOOT_SECONDS)
+        return _wait_for_whatsapp(max_wait=60)
+
+    except subprocess.TimeoutExpired:
+        logger.error("Gateway restart timed out")
+        return False
+    except Exception as e:
+        logger.error(f"Gateway restart error: {e}")
+        return False
+
+
+def restart_all() -> bool:
+    """Full docker compose down/up (preserves volumes and env)."""
+    logger.info("ACTION: Full restart (docker compose down/up)...")
+    try:
+        _ssh_cmd(f"cd {config.OPENCLAW_DIR} && docker compose down", timeout=60)
         time.sleep(5)
 
-        # Start containers
         result = _ssh_cmd(f"cd {config.OPENCLAW_DIR} && docker compose up -d", timeout=60)
         if result.returncode != 0:
             logger.error(f"docker compose up failed: {result.stderr}")
             return False
 
-        logger.info(f"Containers restarted. stdout: {result.stdout.strip()}")
-
-        # Wait for containers to stabilize
-        time.sleep(10)
-
-        # Verify containers are running
-        verify = _ssh_cmd("docker ps --filter name=openclaw --format '{{.Names}} {{.Status}}'")
-        if verify.returncode == 0 and "Up" in verify.stdout:
-            logger.info(f"Containers verified running: {verify.stdout.strip()}")
-            return True
-        else:
-            logger.error(f"Containers not running after restart: {verify.stdout}")
-            return False
+        logger.info("Containers started, waiting for gateway boot...")
+        time.sleep(config.GATEWAY_BOOT_SECONDS)
+        return _wait_for_whatsapp(max_wait=90)
 
     except subprocess.TimeoutExpired:
-        logger.error("Container restart timed out")
+        logger.error("Full restart timed out")
         return False
     except Exception as e:
-        logger.error(f"Container restart error: {e}")
+        logger.error(f"Full restart error: {e}")
         return False
 
 
-def revert_last_commit() -> bool:
-    """Revert the last git commit on the target VM and restart."""
-    logger.info("ACTION: Reverting last commit on target VM...")
+def revert_workspace_commit() -> bool:
+    """Revert ClawdBot's last self-modification in the workspace repo, then restart."""
+    logger.info("ACTION: Reverting last workspace commit (ClawdBot self-edit)...")
     try:
         # Show what we're reverting
-        log_result = _ssh_cmd(f"cd {config.OPENCLAW_DIR} && git log --oneline -3")
+        log_result = _ssh_cmd(f"cd {config.WORKSPACE_DIR} && git log --oneline -5 2>&1", timeout=10)
         if log_result.returncode == 0:
-            logger.info(f"Recent commits:\n{log_result.stdout.strip()}")
+            logger.info(f"Workspace recent commits:\n{log_result.stdout.strip()}")
 
-        # Revert HEAD
-        result = _ssh_cmd(f"cd {config.OPENCLAW_DIR} && git revert HEAD --no-edit", timeout=30)
+        # Revert
+        result = _ssh_cmd(f"cd {config.WORKSPACE_DIR} && git revert HEAD --no-edit 2>&1", timeout=30)
         if result.returncode != 0:
-            logger.error(f"Git revert failed: {result.stderr}")
-            # Try to abort if revert left a bad state
-            _ssh_cmd(f"cd {config.OPENCLAW_DIR} && git revert --abort")
+            logger.error(f"Workspace revert failed: {result.stderr}")
+            _ssh_cmd(f"cd {config.WORKSPACE_DIR} && git revert --abort 2>&1")
             return False
 
-        logger.info(f"Git revert successful: {result.stdout.strip()}")
+        logger.info(f"Workspace revert successful: {result.stdout.strip()}")
 
-        # Rebuild and restart containers
-        rebuild = _ssh_cmd(f"cd {config.OPENCLAW_DIR} && docker compose down && docker compose build && docker compose up -d", timeout=120)
-        if rebuild.returncode != 0:
-            logger.error(f"Rebuild after revert failed: {rebuild.stderr}")
-            return False
-
-        logger.info("Revert + rebuild completed")
-        return True
+        # Restart gateway to pick up changes
+        return restart_gateway()
 
     except subprocess.TimeoutExpired:
-        logger.error("Revert operation timed out")
+        logger.error("Workspace revert timed out")
         return False
     except Exception as e:
-        logger.error(f"Revert error: {e}")
+        logger.error(f"Workspace revert error: {e}")
+        return False
+
+
+def revert_openclaw_commit() -> bool:
+    """Revert the last commit in the openclaw deployment, rebuild, and restart."""
+    logger.info("ACTION: Reverting last openclaw deploy commit...")
+    try:
+        log_result = _ssh_cmd(f"cd {config.OPENCLAW_DIR} && git log --oneline -5 2>&1", timeout=10)
+        if log_result.returncode == 0:
+            logger.info(f"OpenClaw recent commits:\n{log_result.stdout.strip()}")
+
+        result = _ssh_cmd(f"cd {config.OPENCLAW_DIR} && git revert HEAD --no-edit 2>&1", timeout=30)
+        if result.returncode != 0:
+            logger.error(f"OpenClaw revert failed: {result.stderr}")
+            _ssh_cmd(f"cd {config.OPENCLAW_DIR} && git revert --abort 2>&1")
+            return False
+
+        logger.info("OpenClaw revert successful, rebuilding...")
+        return restart_all()
+
+    except subprocess.TimeoutExpired:
+        logger.error("OpenClaw revert timed out")
+        return False
+    except Exception as e:
+        logger.error(f"OpenClaw revert error: {e}")
         return False
 
 
 def reboot_vm() -> bool:
-    """Reboot the target VM via GCP API."""
+    """Reboot the target VM via GCP API — last resort."""
     logger.info("ACTION: Rebooting target VM via gcloud...")
     try:
         result = subprocess.run(
@@ -110,32 +158,29 @@ def reboot_vm() -> bool:
                 f"--zone={config.GCP_ZONE}",
                 f"--project={config.GCP_PROJECT}",
             ],
-            capture_output=True,
-            text=True,
-            timeout=120,
+            capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
             logger.error(f"gcloud reset failed: {result.stderr}")
             return False
 
-        logger.info(f"VM reboot initiated: {result.stdout.strip()}")
+        logger.info("VM reboot initiated, waiting 90s for boot...")
+        time.sleep(90)
 
-        # Wait for VM to come back up
-        logger.info("Waiting 60s for VM to boot...")
-        time.sleep(60)
-
-        # Check if SSH is back
+        # Wait for SSH
         for attempt in range(6):
             try:
                 check = _ssh_cmd("echo ok", timeout=10)
                 if check.returncode == 0:
-                    logger.info(f"VM back online after reboot (attempt {attempt + 1})")
-                    return True
+                    logger.info(f"VM back online (attempt {attempt + 1})")
+                    # Docker should auto-start containers (restart: unless-stopped)
+                    time.sleep(config.GATEWAY_BOOT_SECONDS)
+                    return _wait_for_whatsapp(max_wait=90)
             except Exception:
                 pass
-            time.sleep(10)
+            time.sleep(15)
 
-        logger.error("VM did not come back after reboot within timeout")
+        logger.error("VM did not come back after reboot")
         return False
 
     except subprocess.TimeoutExpired:
@@ -147,10 +192,12 @@ def reboot_vm() -> bool:
 
 
 def execute_action(action: str) -> bool:
-    """Execute a recovery action by name. Returns True if successful."""
+    """Execute a recovery action by name."""
     actions = {
-        "restart_containers": restart_containers,
-        "revert_last_commit": revert_last_commit,
+        "restart_gateway": restart_gateway,
+        "restart_all": restart_all,
+        "revert_workspace_commit": revert_workspace_commit,
+        "revert_openclaw_commit": revert_openclaw_commit,
         "reboot_vm": reboot_vm,
         "escalate": lambda: (logger.warning("ESCALATE: Manual intervention required"), True)[1],
         "no_action": lambda: (logger.info("No action needed"), True)[1],
